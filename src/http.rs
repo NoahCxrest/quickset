@@ -120,21 +120,26 @@ impl HttpServer {
         Some(manager)
     }
 
-    // parse table config string: "source:target:col1:type1,col2:type2"
+    // parse table config string: "source:target:col1=type1,col2=type2"
     fn parse_table_config(s: &str) -> Option<SyncTable> {
+        log_info!("sync", "parsing table config: {}", s);
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() < 2 {
+            log_warn!("sync", "table config has fewer than 2 parts");
             return None;
         }
 
         let source = parts[0];
         let target = parts[1];
         let mut table = SyncTable::new(source, target);
+        log_info!("sync", "source={}, target={}", source, target);
 
         if parts.len() >= 3 {
             // parse columns
+            log_info!("sync", "parsing columns: {}", parts[2]);
             for col_def in parts[2].split(',') {
                 let col_parts: Vec<&str> = col_def.split('=').collect();
+                log_debug!("sync", "column def: {:?}", col_parts);
                 if col_parts.len() >= 2 {
                     let col_name = col_parts[0];
                     let col_type = match col_parts[1].to_lowercase().as_str() {
@@ -144,11 +149,13 @@ impl HttpServer {
                         "bytes" => ColumnType::Bytes,
                         _ => ColumnType::String,
                     };
+                    log_info!("sync", "adding column: {} ({:?})", col_name, col_type);
                     table = table.with_column(col_name, col_name, col_type);
                 }
             }
         }
 
+        log_info!("sync", "parsed table with {} columns", table.columns.len());
         Some(table)
     }
 
