@@ -3,21 +3,13 @@ FROM rust:1.75-slim AS builder
 
 WORKDIR /app
 
-# copy manifests
+# copy everything we need for the build
 COPY Cargo.toml Cargo.lock* ./
-
-# create dummy src and bench to cache dependencies
-RUN mkdir -p src benches && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "fn main() {}" > benches/search_benchmarks.rs
-RUN cargo build --release && rm -rf src benches
-
-# copy actual source
 COPY src ./src
 COPY benches ./benches
 
 # build for release
-RUN touch src/main.rs && cargo build --release
+RUN cargo build --release
 
 # runtime stage - small as fuck
 FROM debian:bookworm-slim
