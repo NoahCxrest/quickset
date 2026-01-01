@@ -10,6 +10,24 @@ use crate::table::ColumnType;
 
 use super::source::{FetchResult, Source, SourceConfig, SourceError, SyncTable};
 
+// url-encode a string for query parameters
+fn url_encode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 3);
+    for c in s.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                result.push(c);
+            }
+            _ => {
+                for byte in c.to_string().as_bytes() {
+                    result.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+    }
+    result
+}
+
 pub struct ClickHouseSource {
     config: SourceConfig,
     connected: bool,
@@ -53,9 +71,9 @@ impl ClickHouseSource {
             .map_err(|e| SourceError::Connection(e.to_string()))?;
 
         // build http request
-        let db = self.config.database.as_deref().unwrap_or("default");
-        let user = self.config.user.as_deref().unwrap_or("default");
-        let pass = self.config.password.as_deref().unwrap_or("");
+        let db = url_encode(self.config.database.as_deref().unwrap_or("default"));
+        let user = url_encode(self.config.user.as_deref().unwrap_or("default"));
+        let pass = url_encode(self.config.password.as_deref().unwrap_or(""));
         
         // use tsv format for easier parsing
         let full_query = format!("{} FORMAT TabSeparated", query);
