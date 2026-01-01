@@ -7,6 +7,7 @@ pub mod table;
 pub mod auth;
 pub mod log;
 pub mod config;
+pub mod sync;
 
 pub use storage::*;
 pub use index::*;
@@ -15,3 +16,4 @@ pub use table::*;
 pub use auth::*;
 pub use log::*;
 pub use config::*;
+pub use sync::*;

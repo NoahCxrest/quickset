@@ -89,6 +89,57 @@ impl Config {
     }
 }
 
+// sync source configuration (parsed from env)
+#[derive(Clone, Debug)]
+pub struct SyncSourceConfig {
+    pub enabled: bool,
+    pub source_type: String,        // "clickhouse" for now
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+    pub interval_secs: u64,
+    pub tables: Vec<String>,        // comma-separated table mappings
+}
+
+impl SyncSourceConfig {
+    pub fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("QUICKSET_SYNC_ENABLED")
+                .map(|s| s == "1" || s.to_lowercase() == "true")
+                .unwrap_or(false),
+            source_type: std::env::var("QUICKSET_SYNC_SOURCE")
+                .unwrap_or_else(|_| "clickhouse".to_string()),
+            host: std::env::var("QUICKSET_SYNC_HOST")
+                .unwrap_or_else(|_| "localhost".to_string()),
+            port: std::env::var("QUICKSET_SYNC_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8123),
+            user: std::env::var("QUICKSET_SYNC_USER")
+                .unwrap_or_else(|_| "default".to_string()),
+            password: std::env::var("QUICKSET_SYNC_PASSWORD")
+                .unwrap_or_default(),
+            database: std::env::var("QUICKSET_SYNC_DATABASE")
+                .unwrap_or_else(|_| "default".to_string()),
+            interval_secs: std::env::var("QUICKSET_SYNC_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300), // default 5 minutes
+            tables: std::env::var("QUICKSET_SYNC_TABLES")
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl Default for SyncSourceConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self::from_env()
@@ -136,5 +187,24 @@ mod tests {
         assert!(AuthLevel::Read.requires_auth_for_write());
         
         assert!(AuthLevel::All.requires_auth_for_health());
+    }
+
+    #[test]
+    fn test_sync_config_defaults() {
+        let config = SyncSourceConfig {
+            enabled: false,
+            source_type: "clickhouse".to_string(),
+            host: "localhost".to_string(),
+            port: 8123,
+            user: "default".to_string(),
+            password: String::new(),
+            database: "default".to_string(),
+            interval_secs: 300,
+            tables: vec![],
+        };
+        
+        assert!(!config.enabled);
+        assert_eq!(config.source_type, "clickhouse");
+        assert_eq!(config.port, 8123);
     }
 }

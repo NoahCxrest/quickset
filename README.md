@@ -74,6 +74,37 @@ all configuration is done via environment variables:
 | `QUICKSET_LOG` | `info` | log level (trace/debug/info/warn/error/off) |
 | `QUICKSET_MAX_CONN` | `1000` | max connections |
 
+### sync configuration (clickhouse)
+
+quickset can periodically sync data from clickhouse (or other sources in the future).
+
+| variable | default | description |
+|----------|---------|-------------|
+| `QUICKSET_SYNC_ENABLED` | `false` | enable sync |
+| `QUICKSET_SYNC_SOURCE` | `clickhouse` | source type |
+| `QUICKSET_SYNC_HOST` | `localhost` | source host |
+| `QUICKSET_SYNC_PORT` | `8123` | source port (http interface) |
+| `QUICKSET_SYNC_USER` | `default` | source username |
+| `QUICKSET_SYNC_PASSWORD` | | source password |
+| `QUICKSET_SYNC_DATABASE` | `default` | source database |
+| `QUICKSET_SYNC_INTERVAL` | `300` | sync interval in seconds (0 = manual only) |
+| `QUICKSET_SYNC_TABLES` | | tables to sync (see format below) |
+
+#### table format
+
+tables are specified as comma-separated strings:
+
+```
+source_table:target_table:col1=type,col2=type
+```
+
+example:
+```bash
+QUICKSET_SYNC_TABLES="users:users:id=int,name=string,email=string,products:products:id=int,title=string,price=float"
+```
+
+types: `int`, `float`, `string`, `bytes`
+
 ### auth levels
 
 you can configure how much of your api is locked down:
@@ -218,6 +249,48 @@ curl http://localhost:8080/stats
 
 ```bash
 curl http://localhost:8080/health
+```
+
+## sync api
+
+if sync is configured, you can check status and trigger manual syncs.
+
+### sync status
+
+```bash
+curl http://localhost:8080/sync/status
+```
+
+returns:
+```json
+{
+  "success": true,
+  "data": {
+    "tables": [
+      {
+        "table": "users",
+        "last_sync_ago_secs": 120,
+        "last_row_count": 50000,
+        "last_duration_ms": 234,
+        "error": null,
+        "syncing": false
+      }
+    ],
+    "running": true,
+    "total_syncs": 42
+  }
+}
+```
+
+### trigger sync (admin only)
+
+```bash
+# sync all tables
+curl -u admin:admin -X POST http://localhost:8080/sync/trigger
+
+# sync specific table
+curl -u admin:admin -X POST http://localhost:8080/sync/trigger \
+  -d '{"table":"users"}'
 ```
 
 ## running tests

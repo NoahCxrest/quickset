@@ -159,6 +159,71 @@ pub struct StatsResponse {
     pub tables: Vec<TableInfo>,
 }
 
+// sync-related request/response types
+#[derive(Debug, Deserialize)]
+pub struct SyncConfigRequest {
+    pub source_type: Option<String>,        // "clickhouse"
+    pub host: String,
+    pub port: u16,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub database: Option<String>,
+    pub interval_secs: Option<u64>,
+    pub tables: Vec<SyncTableRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncTableRequest {
+    pub source_table: String,
+    pub target_table: String,
+    pub columns: Vec<SyncColumnRequest>,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncColumnRequest {
+    pub source: String,
+    pub target: String,
+    #[serde(rename = "type")]
+    pub col_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncTriggerRequest {
+    pub table: Option<String>,  // if none, sync all
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncStatusResponse {
+    pub tables: Vec<SyncTableStatus>,
+    pub running: bool,
+    pub total_syncs: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncTableStatus {
+    pub table: String,
+    pub last_sync_ago_secs: Option<u64>,
+    pub last_row_count: usize,
+    pub last_duration_ms: u64,
+    pub error: Option<String>,
+    pub syncing: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncResultResponse {
+    pub results: Vec<SyncTableResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncTableResult {
+    pub table: String,
+    pub success: bool,
+    pub rows_synced: usize,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

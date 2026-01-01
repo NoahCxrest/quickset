@@ -2,19 +2,22 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use crate::auth::{AuthManager, Role};
-use crate::config::{AuthLevel, Config};
+use crate::config::{AuthLevel, Config, SyncSourceConfig};
 use crate::log::{LogLevel, Logger};
 use crate::query::*;
 use crate::search::SearchType;
 use crate::storage::Value;
-use crate::table::{Column, Database};
+use crate::sync::{ClickHouseSource, Source, SourceConfig, SyncConfig, SyncManager, SyncTable};
+use crate::table::{Column, ColumnType, Database};
 use crate::{log_debug, log_error, log_info, log_warn};
 
 pub struct HttpServer {
     db: Arc<RwLock<Database>>,
     auth: Arc<AuthManager>,
+    sync: Option<Arc<SyncManager>>,
     config: Config,
 }
 
@@ -34,9 +37,15 @@ impl HttpServer {
             auth.add_user(&config.admin_user, &config.admin_pass, Role::Admin).ok();
         }
 
+        let db = Arc::new(RwLock::new(Database::new()));
+        
+        // setup sync from environment if configured
+        let sync = Self::setup_sync_from_env(&db);
+
         Self {
-            db: Arc::new(RwLock::new(Database::new())),
+            db,
             auth: Arc::new(auth),
+            sync,
             config,
         }
     }
@@ -52,23 +61,115 @@ impl HttpServer {
         Self {
             db: Arc::new(RwLock::new(db)),
             auth: Arc::new(auth),
+            sync: None,
             config,
         }
+    }
+
+    // setup sync manager from environment variables
+    fn setup_sync_from_env(db: &Arc<RwLock<Database>>) -> Option<Arc<SyncManager>> {
+        let sync_config = SyncSourceConfig::from_env();
+        
+        if !sync_config.enabled {
+            return None;
+        }
+
+        log_info!("sync", "setting up sync from environment");
+        
+        // parse table configs (format: "source:target:col1:type1,col2:type2")
+        let tables: Vec<SyncTable> = sync_config.tables.iter()
+            .filter_map(|t| Self::parse_table_config(t))
+            .collect();
+
+        if tables.is_empty() {
+            log_warn!("sync", "no tables configured for sync");
+            return None;
+        }
+
+        // create source based on type
+        let source: Box<dyn Source> = match sync_config.source_type.as_str() {
+            "clickhouse" => {
+                let mut source_cfg = SourceConfig::new(&sync_config.host, sync_config.port);
+                if !sync_config.user.is_empty() {
+                    source_cfg = source_cfg.with_auth(&sync_config.user, &sync_config.password);
+                }
+                if !sync_config.database.is_empty() {
+                    source_cfg = source_cfg.with_database(&sync_config.database);
+                }
+                Box::new(ClickHouseSource::new(source_cfg))
+            }
+            other => {
+                log_error!("sync", "unsupported source type: {}", other);
+                return None;
+            }
+        };
+
+        let config = SyncConfig::new()
+            .with_interval(sync_config.interval_secs);
+        
+        let mut config = config;
+        for table in tables {
+            config = config.with_table(table);
+        }
+
+        let manager = Arc::new(SyncManager::new(source, config));
+        
+        // start background sync
+        manager.clone().start_background_sync(Arc::clone(db));
+
+        Some(manager)
+    }
+
+    // parse table config string: "source:target:col1:type1,col2:type2"
+    fn parse_table_config(s: &str) -> Option<SyncTable> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+
+        let source = parts[0];
+        let target = parts[1];
+        let mut table = SyncTable::new(source, target);
+
+        if parts.len() >= 3 {
+            // parse columns
+            for col_def in parts[2].split(',') {
+                let col_parts: Vec<&str> = col_def.split('=').collect();
+                if col_parts.len() >= 2 {
+                    let col_name = col_parts[0];
+                    let col_type = match col_parts[1].to_lowercase().as_str() {
+                        "int" | "i64" => ColumnType::Int,
+                        "float" | "f64" => ColumnType::Float,
+                        "string" | "text" => ColumnType::String,
+                        "bytes" => ColumnType::Bytes,
+                        _ => ColumnType::String,
+                    };
+                    table = table.with_column(col_name, col_name, col_type);
+                }
+            }
+        }
+
+        Some(table)
     }
 
     pub fn run(&self, addr: &str) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr)?;
         log_info!("server", "quickset listening on {}", addr);
         log_info!("server", "auth level: {:?}", self.config.auth_level);
+        
+        if self.sync.is_some() {
+            log_info!("server", "sync enabled");
+        }
 
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let db = Arc::clone(&self.db);
                     let auth = Arc::clone(&self.auth);
+                    let sync = self.sync.clone();
                     let auth_level = self.config.auth_level;
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_connection(stream, db, auth, auth_level) {
+                        if let Err(e) = handle_connection(stream, db, auth, sync, auth_level) {
                             log_error!("http", "connection error: {}", e);
                         }
                     });
@@ -172,13 +273,14 @@ fn handle_connection(
     mut stream: TcpStream,
     db: Arc<RwLock<Database>>,
     auth: Arc<AuthManager>,
+    sync: Option<Arc<SyncManager>>,
     auth_level: AuthLevel,
 ) -> std::io::Result<()> {
     let request = parse_request(&mut stream)?;
     
     log_debug!("http", "{} {}", request.method, request.path);
     
-    let (status, response_body) = route_request(&request, db, auth, auth_level);
+    let (status, response_body) = route_request(&request, db, auth, sync, auth_level);
     
     if status >= 400 {
         log_warn!("http", "{} {} -> {}", request.method, request.path, status);
@@ -227,7 +329,13 @@ fn check_auth(
     }
 }
 
-fn route_request(request: &HttpRequest, db: Arc<RwLock<Database>>, auth: Arc<AuthManager>, auth_level: AuthLevel) -> (u16, String) {
+fn route_request(
+    request: &HttpRequest, 
+    db: Arc<RwLock<Database>>, 
+    auth: Arc<AuthManager>, 
+    sync: Option<Arc<SyncManager>>,
+    auth_level: AuthLevel
+) -> (u16, String) {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => {
             if let Err(e) = check_auth(request, &auth, auth_level, false, true) { return e; }
@@ -269,6 +377,26 @@ fn route_request(request: &HttpRequest, db: Arc<RwLock<Database>>, auth: Arc<Aut
             if let Err(e) = check_auth(request, &auth, auth_level, true, false) { return e; }
             handle_update(request, db)
         }
+        // sync endpoints
+        ("GET", "/sync/status") => {
+            if let Err(e) = check_auth(request, &auth, auth_level, false, false) { return e; }
+            handle_sync_status(sync)
+        }
+        ("POST", "/sync/trigger") => {
+            match check_auth(request, &auth, auth_level, true, false) {
+                Err(e) => e,
+                Ok(role) if !role.can_admin() => (403, serde_json::to_string(&ApiResponse::<()>::err("admin required")).unwrap()),
+                Ok(_) => handle_sync_trigger(request, db, sync),
+            }
+        }
+        ("POST", "/sync/configure") => {
+            match check_auth(request, &auth, auth_level, true, false) {
+                Err(e) => e,
+                Ok(role) if !role.can_admin() => (403, serde_json::to_string(&ApiResponse::<()>::err("admin required")).unwrap()),
+                Ok(_) => handle_sync_configure(request, db),
+            }
+        }
+        // auth endpoints
         ("POST", "/auth/user/add") => {
             match check_auth(request, &auth, auth_level, true, false) {
                 Err(e) => e,
@@ -582,6 +710,105 @@ fn handle_list_users(auth: &AuthManager) -> (u16, String) {
         .collect();
     
     (200, serde_json::to_string(&ApiResponse::ok(users)).unwrap())
+}
+
+// sync handlers
+
+fn handle_sync_status(sync: Option<Arc<SyncManager>>) -> (u16, String) {
+    let sync = match sync {
+        Some(s) => s,
+        None => return (200, serde_json::to_string(&ApiResponse::ok(SyncStatusResponse {
+            tables: vec![],
+            running: false,
+            total_syncs: 0,
+        })).unwrap()),
+    };
+
+    let now = Instant::now();
+    let statuses: Vec<SyncTableStatus> = sync.status().into_iter()
+        .map(|s| SyncTableStatus {
+            table: s.table,
+            last_sync_ago_secs: s.last_sync.map(|t| now.duration_since(t).as_secs()),
+            last_row_count: s.last_row_count,
+            last_duration_ms: s.last_duration_ms,
+            error: s.error,
+            syncing: s.syncing,
+        })
+        .collect();
+
+    let response = SyncStatusResponse {
+        tables: statuses,
+        running: sync.is_running(),
+        total_syncs: sync.sync_count(),
+    };
+
+    (200, serde_json::to_string(&ApiResponse::ok(response)).unwrap())
+}
+
+fn handle_sync_trigger(
+    request: &HttpRequest, 
+    db: Arc<RwLock<Database>>, 
+    sync: Option<Arc<SyncManager>>
+) -> (u16, String) {
+    let sync = match sync {
+        Some(s) => s,
+        None => return (400, serde_json::to_string(&ApiResponse::<()>::err("sync not configured")).unwrap()),
+    };
+
+    let req: SyncTriggerRequest = match serde_json::from_slice(&request.body) {
+        Ok(r) => r,
+        Err(_) => SyncTriggerRequest { table: None }, // default to sync all
+    };
+
+    log_info!("sync", "manual sync triggered");
+
+    let results: Vec<SyncTableResult> = if let Some(table_name) = req.table {
+        // sync specific table - find it in config
+        // for now just sync all since we don't expose individual table sync easily
+        sync.sync_all(&db).into_iter()
+            .filter(|r| r.table == table_name)
+            .map(|r| SyncTableResult {
+                table: r.table,
+                success: r.success,
+                rows_synced: r.rows_synced,
+                duration_ms: r.duration_ms,
+                error: r.error,
+            })
+            .collect()
+    } else {
+        sync.sync_all(&db).into_iter()
+            .map(|r| SyncTableResult {
+                table: r.table,
+                success: r.success,
+                rows_synced: r.rows_synced,
+                duration_ms: r.duration_ms,
+                error: r.error,
+            })
+            .collect()
+    };
+
+    let response = SyncResultResponse { results };
+    (200, serde_json::to_string(&ApiResponse::ok(response)).unwrap())
+}
+
+fn handle_sync_configure(
+    request: &HttpRequest, 
+    _db: Arc<RwLock<Database>>
+) -> (u16, String) {
+    // this endpoint lets you configure sync at runtime
+    // for now, return an error since we'd need to store sync manager differently
+    // to allow runtime reconfiguration
+    
+    let _req: SyncConfigRequest = match serde_json::from_slice(&request.body) {
+        Ok(r) => r,
+        Err(e) => return (400, serde_json::to_string(&ApiResponse::<()>::err(&e.to_string())).unwrap()),
+    };
+
+    // todo: implement runtime sync configuration
+    // for now, sync must be configured via environment variables
+    (501, serde_json::to_string(&ApiResponse::<()>::err(
+        "runtime sync configuration not yet implemented - use environment variables"
+    )).unwrap())
 }
 
 #[cfg(test)]
